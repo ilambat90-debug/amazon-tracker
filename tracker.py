@@ -19,16 +19,18 @@ SEEN_FILE = "seen_asins.json"
 CHECK_INTERVAL = 3600  # 60 minutes
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")  # Your private #amazon-tracker channel ID
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 
 BASE_URL = "https://www.amazon.co.uk/s?me={seller_id}&marketplaceID=A1F83G8C2ARO7P"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
 ]
 
 def load_config():
@@ -53,61 +55,97 @@ def load_seen():
 def save_seen(seen):
     save_json(SEEN_FILE, seen)
 
-def get_headers():
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+def get_session():
+    session = requests.Session()
+    ua = random.choice(USER_AGENTS)
+    session.headers.update({
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-GB,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
         "DNT": "1",
-        "Referer": "https://www.amazon.co.uk/",
-    }
+    })
+    return session
 
 def scrape_seller_asins(seller_id, seller_name):
     url = BASE_URL.format(seller_id=seller_id)
     products = []
+    max_retries = 3
 
-    try:
-        time.sleep(random.uniform(3, 8))  # polite delay
-        resp = requests.get(url, headers=get_headers(), timeout=20)
-        if resp.status_code != 200:
-            log.warning(f"[{seller_name}] HTTP {resp.status_code}")
-            return products
+    for attempt in range(max_retries):
+        try:
+            # Longer random delay between requests
+            delay = random.uniform(10, 25)
+            log.info(f"[{seller_name}] Waiting {delay:.1f}s before request...")
+            time.sleep(delay)
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        items = soup.select('[data-asin]')
+            session = get_session()
 
-        for item in items:
-            asin = item.get("data-asin", "").strip()
-            if not asin or len(asin) != 10:
+            # First visit Amazon homepage to get cookies
+            session.get("https://www.amazon.co.uk", timeout=15)
+            time.sleep(random.uniform(2, 5))
+
+            # Now scrape the seller page
+            resp = session.get(url, timeout=20)
+
+            if resp.status_code == 503:
+                log.warning(f"[{seller_name}] HTTP 503 (attempt {attempt+1}/{max_retries}) — waiting longer...")
+                time.sleep(random.uniform(30, 60))
                 continue
 
-            title_el = item.select_one("h2 span") or item.select_one(".a-size-medium")
-            title = title_el.get_text(strip=True) if title_el else "Unknown Title"
+            if resp.status_code == 200:
+                # Check if we got a CAPTCHA page
+                if "api-services-support@amazon.com" in resp.text or "Type the characters" in resp.text:
+                    log.warning(f"[{seller_name}] CAPTCHA detected (attempt {attempt+1}/{max_retries})")
+                    time.sleep(random.uniform(60, 120))
+                    continue
 
-            price_el = item.select_one(".a-price .a-offscreen") or item.select_one(".a-price-whole")
-            price = price_el.get_text(strip=True) if price_el else "N/A"
+                soup = BeautifulSoup(resp.text, "html.parser")
+                items = soup.select('[data-asin]')
 
-            img_el = item.select_one("img.s-image")
-            image = img_el.get("src", "") if img_el else ""
+                for item in items:
+                    asin = item.get("data-asin", "").strip()
+                    if not asin or len(asin) != 10:
+                        continue
 
-            link = f"https://www.amazon.co.uk/dp/{asin}"
+                    title_el = item.select_one("h2 span") or item.select_one(".a-size-medium")
+                    title = title_el.get_text(strip=True) if title_el else "Unknown Title"
 
-            products.append({
-                "asin": asin,
-                "title": title,
-                "price": price,
-                "image": image,
-                "link": link,
-            })
+                    price_el = item.select_one(".a-price .a-offscreen") or item.select_one(".a-price-whole")
+                    price = price_el.get_text(strip=True) if price_el else "N/A"
 
-        log.info(f"[{seller_name}] Found {len(products)} products on storefront")
+                    img_el = item.select_one("img.s-image")
+                    image = img_el.get("src", "") if img_el else ""
 
-    except Exception as e:
-        log.error(f"[{seller_name}] Scrape error: {e}")
+                    link = f"https://www.amazon.co.uk/dp/{asin}"
 
+                    products.append({
+                        "asin": asin,
+                        "title": title,
+                        "price": price,
+                        "image": image,
+                        "link": link,
+                    })
+
+                log.info(f"[{seller_name}] Found {len(products)} products on storefront")
+                return products
+
+            else:
+                log.warning(f"[{seller_name}] HTTP {resp.status_code} (attempt {attempt+1}/{max_retries})")
+                time.sleep(random.uniform(20, 40))
+
+        except Exception as e:
+            log.error(f"[{seller_name}] Scrape error (attempt {attempt+1}/{max_retries}): {e}")
+            time.sleep(random.uniform(15, 30))
+
+    log.error(f"[{seller_name}] All {max_retries} attempts failed — skipping this check")
     return products
 
 

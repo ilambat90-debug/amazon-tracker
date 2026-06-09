@@ -21,7 +21,8 @@ CHECK_INTERVAL = 3600  # 60 minutes
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 
-BASE_URL = "https://www.amazon.co.uk/s?me={seller_id}&marketplaceID=A1F83G8C2ARO7P"
+# Matches exactly the URL format that worAks: amazon.co.uk/s?me=XXXX
+BASE_URL = "https://www.amazon.co.uk/s?me={seller_id}&page={page}"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -74,79 +75,128 @@ def get_session():
     })
     return session
 
-def scrape_seller_asins(seller_id, seller_name):
-    url = BASE_URL.format(seller_id=seller_id)
+def parse_products(soup):
+    """Extract products from a BeautifulSoup parsed page."""
     products = []
+    items = soup.select('div[data-asin]')
+
+    for item in items:
+        asin = item.get("data-asin", "").strip()
+        if not asin or len(asin) != 10:
+            continue
+
+        title_el = (
+            item.select_one("h2 a span") or
+            item.select_one("h2 span") or
+            item.select_one(".a-size-medium.a-color-base.a-text-normal") or
+            item.select_one(".a-size-base-plus.a-color-base.a-text-normal")
+        )
+        title = title_el.get_text(strip=True) if title_el else "Unknown Title"
+
+        price_el = item.select_one(".a-price .a-offscreen")
+        price = price_el.get_text(strip=True) if price_el else "N/A"
+
+        img_el = item.select_one("img.s-image")
+        image = img_el.get("src", "") if img_el else ""
+
+        link = f"https://www.amazon.co.uk/dp/{asin}"
+
+        products.append({
+            "asin": asin,
+            "title": title,
+            "price": price,
+            "image": image,
+            "link": link,
+        })
+
+    return products
+
+def has_next_page(soup):
+    """Check if there is a next page of results."""
+    next_btn = soup.select_one("a.s-pagination-next:not(.s-pagination-disabled)")
+    return next_btn is not None
+
+def fetch_page(session, seller_id, seller_name, page):
+    """Fetch a single page with retries. Returns (soup, success)."""
+    url = BASE_URL.format(seller_id=seller_id, page=page)
     max_retries = 3
 
     for attempt in range(max_retries):
         try:
-            # Longer random delay between requests
-            delay = random.uniform(10, 25)
-            log.info(f"[{seller_name}] Waiting {delay:.1f}s before request...")
+            delay = random.uniform(8, 20)
+            log.info(f"[{seller_name}] Page {page} — waiting {delay:.1f}s...")
             time.sleep(delay)
 
-            session = get_session()
-
-            # First visit Amazon homepage to get cookies
-            session.get("https://www.amazon.co.uk", timeout=15)
-            time.sleep(random.uniform(2, 5))
-
-            # Now scrape the seller page
             resp = session.get(url, timeout=20)
 
-            if resp.status_code == 503:
-                log.warning(f"[{seller_name}] HTTP 503 (attempt {attempt+1}/{max_retries}) — waiting longer...")
+            if resp.status_code in (503, 202):
+                log.warning(f"[{seller_name}] HTTP {resp.status_code} page {page} (attempt {attempt+1}/{max_retries})")
                 time.sleep(random.uniform(30, 60))
                 continue
 
             if resp.status_code == 200:
-                # Check if we got a CAPTCHA page
                 if "api-services-support@amazon.com" in resp.text or "Type the characters" in resp.text:
-                    log.warning(f"[{seller_name}] CAPTCHA detected (attempt {attempt+1}/{max_retries})")
+                    log.warning(f"[{seller_name}] CAPTCHA on page {page} (attempt {attempt+1}/{max_retries})")
                     time.sleep(random.uniform(60, 120))
                     continue
 
                 soup = BeautifulSoup(resp.text, "html.parser")
-                items = soup.select('[data-asin]')
+                return soup, True
 
-                for item in items:
-                    asin = item.get("data-asin", "").strip()
-                    if not asin or len(asin) != 10:
-                        continue
-
-                    title_el = item.select_one("h2 span") or item.select_one(".a-size-medium")
-                    title = title_el.get_text(strip=True) if title_el else "Unknown Title"
-
-                    price_el = item.select_one(".a-price .a-offscreen") or item.select_one(".a-price-whole")
-                    price = price_el.get_text(strip=True) if price_el else "N/A"
-
-                    img_el = item.select_one("img.s-image")
-                    image = img_el.get("src", "") if img_el else ""
-
-                    link = f"https://www.amazon.co.uk/dp/{asin}"
-
-                    products.append({
-                        "asin": asin,
-                        "title": title,
-                        "price": price,
-                        "image": image,
-                        "link": link,
-                    })
-
-                log.info(f"[{seller_name}] Found {len(products)} products on storefront")
-                return products
-
-            else:
-                log.warning(f"[{seller_name}] HTTP {resp.status_code} (attempt {attempt+1}/{max_retries})")
-                time.sleep(random.uniform(20, 40))
-
-        except Exception as e:
-            log.error(f"[{seller_name}] Scrape error (attempt {attempt+1}/{max_retries}): {e}")
+            log.warning(f"[{seller_name}] HTTP {resp.status_code} page {page}")
             time.sleep(random.uniform(15, 30))
 
-    log.error(f"[{seller_name}] All {max_retries} attempts failed — skipping this check")
-    return products
+        except Exception as e:
+            log.error(f"[{seller_name}] Error page {page} attempt {attempt+1}: {e}")
+            time.sleep(random.uniform(10, 25))
+
+    return None, False
+
+def scrape_seller_asins(seller_id, seller_name):
+    """Scrape all pages of a seller storefront."""
+    all_products = []
+    seen_asins = set()
+
+    # Visit homepage first to get cookies
+    session = get_session()
+    try:
+        session.get("https://www.amazon.co.uk", timeout=15)
+        time.sleep(random.uniform(3, 6))
+    except Exception as e:
+        log.warning(f"Homepage pre-visit failed: {e}")
+
+    page = 1
+    max_pages = 20  # safety cap
+
+    while page <= max_pages:
+        soup, success = fetch_page(session, seller_id, seller_name, page)
+
+        if not success:
+            log.error(f"[{seller_name}] Failed to fetch page {page} — stopping pagination")
+            break
+
+        page_products = parse_products(soup)
+
+        # Deduplicate
+        new_on_page = 0
+        for p in page_products:
+            if p["asin"] not in seen_asins:
+                seen_asins.add(p["asin"])
+                all_products.append(p)
+                new_on_page += 1
+
+        log.info(f"[{seller_name}] Page {page}: {new_on_page} products found")
+
+        if not has_next_page(soup):
+            log.info(f"[{seller_name}] No more pages after page {page}")
+            break
+
+        page += 1
+        # Polite delay between pages
+        time.sleep(random.uniform(5, 12))
+
+    log.info(f"[{seller_name}] Total: {len(all_products)} products across {page} page(s)")
+    return all_products
 
 
 def send_discord_notification(product, seller_name):

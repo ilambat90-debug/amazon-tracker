@@ -21,7 +21,6 @@ CHECK_INTERVAL = 3600  # 60 minutes
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 
-# Matches exactly the URL format that worAks: amazon.co.uk/s?me=XXXX
 BASE_URL = "https://www.amazon.co.uk/s?me={seller_id}&page={page}"
 
 USER_AGENTS = [
@@ -29,14 +28,11 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
 ]
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
-        log.warning(f"{CONFIG_FILE} not found — creating empty one.")
         save_json(CONFIG_FILE, {"sellers": []})
     return load_json(CONFIG_FILE)
 
@@ -73,12 +69,19 @@ def get_session():
         "Cache-Control": "max-age=0",
         "DNT": "1",
     })
+    # Set UK locale cookies so Amazon serves UK content even from US servers
+    session.cookies.set("i18n-prefs", "GBP", domain="www.amazon.co.uk")
+    session.cookies.set("sp-cdn", "L5Z9:GB", domain="www.amazon.co.uk")
+    session.cookies.set("lc-acbuk", "en_GB", domain="www.amazon.co.uk")
     return session
 
 def parse_products(soup):
-    """Extract products from a BeautifulSoup parsed page."""
     products = []
-    items = soup.select('div[data-asin]')
+    # Try multiple selectors Amazon uses
+    items = (
+        soup.select('div[data-asin][data-component-type="s-search-result"]') or
+        soup.select('div[data-asin]')
+    )
 
     for item in items:
         asin = item.get("data-asin", "").strip()
@@ -89,7 +92,8 @@ def parse_products(soup):
             item.select_one("h2 a span") or
             item.select_one("h2 span") or
             item.select_one(".a-size-medium.a-color-base.a-text-normal") or
-            item.select_one(".a-size-base-plus.a-color-base.a-text-normal")
+            item.select_one(".a-size-base-plus.a-color-base.a-text-normal") or
+            item.select_one("[data-cy='title-recipe'] span")
         )
         title = title_el.get_text(strip=True) if title_el else "Unknown Title"
 
@@ -112,12 +116,9 @@ def parse_products(soup):
     return products
 
 def has_next_page(soup):
-    """Check if there is a next page of results."""
-    next_btn = soup.select_one("a.s-pagination-next:not(.s-pagination-disabled)")
-    return next_btn is not None
+    return soup.select_one("a.s-pagination-next:not(.s-pagination-disabled)") is not None
 
 def fetch_page(session, seller_id, seller_name, page):
-    """Fetch a single page with retries. Returns (soup, success)."""
     url = BASE_URL.format(seller_id=seller_id, page=page)
     max_retries = 3
 
@@ -136,11 +137,23 @@ def fetch_page(session, seller_id, seller_name, page):
 
             if resp.status_code == 200:
                 if "api-services-support@amazon.com" in resp.text or "Type the characters" in resp.text:
-                    log.warning(f"[{seller_name}] CAPTCHA on page {page} (attempt {attempt+1}/{max_retries})")
+                    log.warning(f"[{seller_name}] CAPTCHA page {page} (attempt {attempt+1}/{max_retries})")
                     time.sleep(random.uniform(60, 120))
                     continue
 
+                # Log a snippet to help debug what Amazon is returning
                 soup = BeautifulSoup(resp.text, "html.parser")
+                result_count_el = soup.select_one(".s-result-count") or soup.select_one("[data-component-type='s-result-info-bar']")
+                if result_count_el:
+                    log.info(f"[{seller_name}] Amazon says: {result_count_el.get_text(strip=True)[:100]}")
+                else:
+                    # Check if page has any search results at all
+                    no_results = soup.select_one(".s-no-outline") or "no results" in resp.text.lower()
+                    if no_results:
+                        log.warning(f"[{seller_name}] Amazon returned a no-results page")
+                    else:
+                        log.info(f"[{seller_name}] Page loaded (no result count found, page length: {len(resp.text)})")
+
                 return soup, True
 
             log.warning(f"[{seller_name}] HTTP {resp.status_code} page {page}")
@@ -153,31 +166,28 @@ def fetch_page(session, seller_id, seller_name, page):
     return None, False
 
 def scrape_seller_asins(seller_id, seller_name):
-    """Scrape all pages of a seller storefront."""
     all_products = []
     seen_asins = set()
 
-    # Visit homepage first to get cookies
     session = get_session()
     try:
+        log.info(f"[{seller_name}] Pre-visiting Amazon UK homepage...")
         session.get("https://www.amazon.co.uk", timeout=15)
         time.sleep(random.uniform(3, 6))
     except Exception as e:
         log.warning(f"Homepage pre-visit failed: {e}")
 
     page = 1
-    max_pages = 20  # safety cap
+    max_pages = 20
 
     while page <= max_pages:
         soup, success = fetch_page(session, seller_id, seller_name, page)
 
         if not success:
-            log.error(f"[{seller_name}] Failed to fetch page {page} — stopping pagination")
+            log.error(f"[{seller_name}] Failed page {page} — stopping")
             break
 
         page_products = parse_products(soup)
-
-        # Deduplicate
         new_on_page = 0
         for p in page_products:
             if p["asin"] not in seen_asins:
@@ -192,7 +202,6 @@ def scrape_seller_asins(seller_id, seller_name):
             break
 
         page += 1
-        # Polite delay between pages
         time.sleep(random.uniform(5, 12))
 
     log.info(f"[{seller_name}] Total: {len(all_products)} products across {page} page(s)")
@@ -241,7 +250,7 @@ def run_check():
     sellers = config.get("sellers", [])
 
     if not sellers:
-        log.info("No sellers configured. Add sellers to sellers.json and restart.")
+        log.info("No sellers configured.")
         return
 
     seen = load_seen()
@@ -250,7 +259,6 @@ def run_check():
     for seller in sellers:
         sid = seller.get("id", "").strip()
         sname = seller.get("name", sid)
-
         if not sid:
             continue
 
@@ -278,7 +286,7 @@ def main():
 
     while True:
         run_check()
-        log.info(f"Sleeping until next check...")
+        log.info("Sleeping until next check...")
         time.sleep(CHECK_INTERVAL)
 
 
